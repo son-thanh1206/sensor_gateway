@@ -1,0 +1,10 @@
+/docs/
+
+# build
+/build/
+/bin/
+
+# runtime
+/gateway.log
+/logFifo
+*.db
