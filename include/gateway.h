@@ -119,4 +119,10 @@ typedef struct {
     bool              stop_requested;
 } gateway_t;
 
+int  gateway_sync_init(gateway_t *gateway);
+void gateway_sync_destroy(gateway_t *gateway);
+void gateway_request_stop(gateway_t *gateway);
+void gateway_wait_for_stop(gateway_t *gateway);
+bool gateway_should_stop(gateway_t *gateway);
+
 #endif /* GATEWAY_H */

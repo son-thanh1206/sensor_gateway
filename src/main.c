@@ -1,157 +1,191 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "connmgr.h"
+#include "datamgr.h"
+#include "debug.h"
+#include "gateway.h"
+#include "logger.h"
+#include "storagemgr.h"
+
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-#include "debug.h"
-#include "gateway.h"
+#define N_PORTS 4
 
-#define THREAD_COUNT     3
-#define LAST_PORT_OFFSET 3
+static gateway_t gateway;
+static volatile sig_atomic_t caught_signal;
 
-static gateway_t gw = {
-    .stop_lock = PTHREAD_MUTEX_INITIALIZER,
-    .stop_cond = PTHREAD_COND_INITIALIZER,
-};
-
-static void handle_stop_signal(int signo)
+/* Only assigns volatile sig_atomic_t variables: anything else (printf,
+ * malloc, mutexes...) is not async-signal-safe (man 7 signal-safety). */
+static void on_signal(int signo)
 {
-    gw.stop = signo;
+    caught_signal = signo;
+    gateway.stop = 1;
 }
 
-static bool parse_port(const char *text, uint16_t *port)
+static void usage(const char *prog)
+{
+    fprintf(stderr, "Usage: %s <TCP base port P> <HTTP port>\n"
+                    "  e.g. %s 1234 8080\n", prog, prog);
+}
+
+static bool parse_port(const char *s, uint16_t *out)
 {
     char *end;
-    long value;
-
     errno = 0;
-    value = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || value < 1 || value > UINT16_MAX)
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 65535)
         return false;
-
-    *port = (uint16_t)value;
+    *out = (uint16_t)v;
     return true;
 }
 
-static bool parse_args(int argc, char *argv[], gateway_t *gateway)
+static bool parse_args(int argc, char *argv[])
 {
-    if (argc != 3)
+    if (argc != 3) {
+        usage(argv[0]);
         return false;
-    if (!parse_port(argv[1], &gateway->base_port) ||
-        !parse_port(argv[2], &gateway->http_port))
+    }
+    if (!parse_port(argv[1], &gateway.base_port)) {
+        fprintf(stderr, "Invalid TCP base port: '%s' (1-65535)\n", argv[1]);
         return false;
-    if (gateway->base_port > UINT16_MAX - LAST_PORT_OFFSET)
+    }
+    if (!parse_port(argv[2], &gateway.http_port)) {
+        fprintf(stderr, "Invalid HTTP port: '%s' (1-65535)\n", argv[2]);
         return false;
-
-    return gateway->http_port < gateway->base_port ||
-           gateway->http_port > gateway->base_port + LAST_PORT_OFFSET;
+    }
+    if (gateway.base_port > 65535 - (N_PORTS - 1)) {
+        fprintf(stderr, "TCP base port too large: P+%d must be <= 65535\n",
+                N_PORTS - 1);
+        return false;
+    }
+    if (gateway.http_port >= gateway.base_port &&
+        gateway.http_port < gateway.base_port + N_PORTS) {
+        fprintf(stderr, "HTTP port must not be in range %u-%u\n",
+                gateway.base_port, gateway.base_port + N_PORTS - 1);
+        return false;
+    }
+    return true;
 }
 
-static void wait_for_stop(gateway_t *gateway)
+static int install_signal_handlers(sigset_t *old_mask)
 {
-    pthread_mutex_lock(&gateway->stop_lock);
-    while (!gateway->stop_requested)
-        pthread_cond_wait(&gateway->stop_cond, &gateway->stop_lock);
-    pthread_mutex_unlock(&gateway->stop_lock);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGINT, &sa, NULL) == -1 ||
+        sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+
+    /* If the log process dies, write() to the FIFO returns EPIPE instead
+     * of SIGPIPE killing the whole gateway. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Threads created later inherit this mask, so SIGINT/SIGTERM can only
+     * be delivered to the main thread, inside sigsuspend(). */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    int rc = pthread_sigmask(SIG_BLOCK, &block, old_mask);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_sigmask: %s\n", strerror(rc));
+        return -1;
+    }
+    return 0;
 }
 
-static void request_stop(gateway_t *gateway)
-{
-    pthread_mutex_lock(&gateway->stop_lock);
-    gateway->stop_requested = true;
-    pthread_cond_broadcast(&gateway->stop_cond);
-    pthread_mutex_unlock(&gateway->stop_lock);
-}
+typedef struct {
+    const char *name;
+    void *(*task)(void *);
+} worker_t;
 
-static void *connmgr_thread(void *arg)
-{
-    printf("CONN Connection manager thread started\n");
-    DEBUG_PRINT("connection manager thread waiting for stop");
-    wait_for_stop(arg);
-    DEBUG_PRINT("connection manager thread exiting");
-    return NULL;
-}
-
-static void *datamgr_thread(void *arg)
-{
-    printf("DATA Data manager thread started\n");
-    DEBUG_PRINT("data manager thread waiting for stop");
-    wait_for_stop(arg);
-    DEBUG_PRINT("data manager thread exiting");
-    return NULL;
-}
-
-static void *storagemgr_thread(void *arg)
-{
-    printf("STOR Storage manager thread started\n");
-    DEBUG_PRINT("storage manager thread waiting for stop");
-    wait_for_stop(arg);
-    DEBUG_PRINT("storage manager thread exiting");
-    return NULL;
-}
+static const worker_t WORKERS[] = {
+    { "connmgr",    connmgr_thread    },
+    { "datamgr",    datamgr_thread    },
+    { "storagemgr", storagemgr_thread },
+};
+#define N_WORKERS (sizeof WORKERS / sizeof WORKERS[0])
 
 int main(int argc, char *argv[])
 {
-    void *(*const entries[THREAD_COUNT])(void *) = {
-        connmgr_thread, datamgr_thread, storagemgr_thread
-    };
-    pthread_t threads[THREAD_COUNT];
-    struct sigaction action = { .sa_handler = handle_stop_signal };
-    sigset_t stop_signals, original_mask;
-    const char *reason;
-    int created = 0;
+    DEBUG_PRINT("Main process PID: %d", getpid());
+    if (!parse_args(argc, argv))
+        return EXIT_FAILURE;
 
-    if (!parse_args(argc, argv, &gw)) {
-        fprintf(stderr,
-                "Usage: %s <tcp_base_port> <http_port>\n"
-                "  ports are 1..65535; the gateway listens on tcp_base_port..+%d,\n"
-                "  so http_port must be outside that range\n",
-                argv[0], LAST_PORT_OFFSET);
+    sigset_t old_mask;
+    if (install_signal_handlers(&old_mask) == -1)
+        return EXIT_FAILURE;
+
+    /* Fork while still single-threaded: fork() copies only the calling
+     * thread, so a mutex held by another thread would stay locked forever
+     * in the child. */
+    gateway.log_pid = log_start(LOG_FIFO_PATH, LOG_FILE_PATH);
+    if (gateway.log_pid == -1)
+        return EXIT_FAILURE;
+    gateway.web_pid = -1;
+
+    printlog(LOG_SRC_MAIN, "Gateway started (TCP base port %u, HTTP port %u)",
+              gateway.base_port, gateway.http_port);
+
+    int exit_code = EXIT_SUCCESS;
+    int rc = gateway_sync_init(&gateway);
+    if (rc != 0) {
+        fprintf(stderr, "gateway_sync_init fail: %s\n", strerror(rc));
+        printlog(LOG_SRC_MAIN, "Gateway shutting down (init error)");
+        log_stop(gateway.log_pid);
         return EXIT_FAILURE;
     }
 
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-
-    /* Block before creating the threads: they inherit this mask, so the  */
-    /* signals reach only the main thread, and only inside sigsuspend().  */
-    sigemptyset(&stop_signals);
-    sigaddset(&stop_signals, SIGINT);
-    sigaddset(&stop_signals, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &stop_signals, &original_mask);
-
-    printf("MAIN Gateway started (TCP base port %u, HTTP port %u)\n",
-           gw.base_port, gw.http_port);
-
-    for (; created < THREAD_COUNT; created++) {
-        int err = pthread_create(&threads[created], NULL, entries[created], &gw);
-        if (err != 0) {
-            fprintf(stderr, "pthread_create: %s\n", strerror(err));
+    pthread_t tids[N_WORKERS];
+    size_t n_started = 0;
+    for (; n_started < N_WORKERS; ++n_started) {
+        rc = pthread_create(&tids[n_started], NULL,
+                            WORKERS[n_started].task, &gateway);
+        if (rc != 0) {
+            fprintf(stderr, "pthread_create %s: %s\n",
+                    WORKERS[n_started].name, strerror(rc));
+            exit_code = EXIT_FAILURE;
             break;
         }
+        DEBUG_PRINT("thread %s created", WORKERS[n_started].name);
     }
 
-    if (created == THREAD_COUNT) {
-        while (!gw.stop)
-            sigsuspend(&original_mask);
-        reason = gw.stop == SIGINT ? "SIGINT" : "SIGTERM";
+    /* sigsuspend() unblocks the signals and sleeps atomically. With
+     * pause(), a signal arriving between the check and the sleep would
+     * be missed and the program would hang. */
+    if (exit_code == EXIT_SUCCESS) {
+        while (!gateway.stop)
+            sigsuspend(&old_mask);
+    }
+
+    if (exit_code == EXIT_SUCCESS) {
+        printlog(LOG_SRC_MAIN, "Gateway shutting down (received %s)",
+                 caught_signal == SIGTERM ? "SIGTERM" : "SIGINT");
     } else {
-        reason = "thread creation failed";
+        printlog(LOG_SRC_MAIN, "Gateway shutting down (thread creation failed)");
     }
 
-    printf("MAIN Gateway shutting down (%s)\n", reason);
+    gateway_request_stop(&gateway);
+    for (size_t i = 0; i < n_started; ++i) {
+        pthread_join(tids[i], NULL);
+        DEBUG_PRINT("thread %s joined", WORKERS[i].name);
+    }
+    gateway_sync_destroy(&gateway);
 
-    request_stop(&gw);
-    for (int i = 0; i < created; i++)
-        pthread_join(threads[i], NULL);
-    DEBUG_PRINT("%d thread(s) joined", created);
+    /* Only after all threads are joined: they may log until they exit. */
+    if (log_stop(gateway.log_pid) != 0)
+        exit_code = EXIT_FAILURE;
 
-    return created == THREAD_COUNT ? EXIT_SUCCESS : EXIT_FAILURE;
+    return exit_code;
 }
