@@ -1,0 +1,20 @@
+# Sensor nodes started by test/test_sensors.sh - one sensor per line.
+# Lines starting with '#' and blank lines are ignored.
+#
+#   type       : temperature | humidity | motion | door | smoke_gas
+#   id         : sensor ID (unique in this file)
+#   host       : gateway address
+#   period_ms  : send period (mean time between events for motion/door)
+#   options    : optional, space separated: --fragment --glue --corrupt
+#
+type,id,host,period_ms,options
+temperature,10,127.0.0.1,100,
+temperature,11,127.0.0.1,200,
+temperature,12,127.0.0.1,50,
+temperature,13,127.0.0.1,500,
+temperature,14,127.0.0.1,100,
+# Step 4:
+# humidity,21,127.0.0.1,200,
+# motion,30,127.0.0.1,1000,
+# door,40,127.0.0.1,1000,
+# smoke_gas,50,127.0.0.1,500,--corrupt

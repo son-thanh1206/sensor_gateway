@@ -11,12 +11,14 @@
 #include <time.h>
 
 #include "protocol_adapter.h"
+#include "sbuffer.h"
 #include "sensor_config.h"
 #include "sensor_types.h"
 
 #define RX_BUF_SIZE  256
 #define MAX_CONN      64
 #define MAX_SENSORS   64
+#define N_PORTS        4                      /* ports P .. P+3 */
 typedef enum { STATE_COLLECTING, STATE_NORMAL, STATE_ALERT } sensor_state_t;
 typedef enum { SQL_CONNECTED, SQL_LOST, SQL_DOWN } sql_state_t;
 
@@ -26,20 +28,7 @@ typedef struct {              /* one line of the room-sensor file */
     sensor_type_t type;
 } sensor_info_t;
 
-typedef struct sbuffer_node {
-    sensor_data_t        data;
-    bool                 read_by_data;
-    bool                 read_by_storage;
-    struct sbuffer_node *next;
-} sbuffer_node_t;
-
-typedef struct {
-    sbuffer_node_t *head, *tail;
-    size_t          size;
-    bool            shutdown;
-    pthread_mutex_t lock;
-    pthread_cond_t  not_empty;
-} sbuffer_t;
+/* sbuffer_node_t, sbuffer_t: see sbuffer.h */
 
 typedef struct {
     int                     fd;
@@ -51,9 +40,11 @@ typedef struct {
 } connection_t;
 
 typedef struct {
-    int          listen_fd[4];                /* ports P .. P+3 */
+    int          listen_fd[N_PORTS];          /* ports P .. P+3, -1 = unused */
+    const protocol_adapter_t *listen_adapter[N_PORTS];
     connection_t conns[MAX_CONN];
     size_t       n_conns;
+    int          wake_fd[2];                  /* self-pipe: wakes poll() on stop */
 } connmgr_t;
 
 typedef struct {
@@ -122,7 +113,6 @@ typedef struct {
 int  gateway_sync_init(gateway_t *gateway);
 void gateway_sync_destroy(gateway_t *gateway);
 void gateway_request_stop(gateway_t *gateway);
-void gateway_wait_for_stop(gateway_t *gateway);
 bool gateway_should_stop(gateway_t *gateway);
 
 #endif /* GATEWAY_H */

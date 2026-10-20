@@ -8,3 +8,6 @@
 /gateway.log
 /logFifo
 *.db
+
+# test output
+/test/out/

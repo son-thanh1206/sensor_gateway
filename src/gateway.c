@@ -29,15 +29,6 @@ void gateway_request_stop(gateway_t *gateway)
     pthread_mutex_unlock(&gateway->stop_lock);
 }
 
-void gateway_wait_for_stop(gateway_t *gateway)
-{
-    pthread_mutex_lock(&gateway->stop_lock);
-    /* while, not if: pthread_cond_wait() may wake up spuriously */
-    while (!gateway->stop_requested)
-        pthread_cond_wait(&gateway->stop_cond, &gateway->stop_lock);
-    pthread_mutex_unlock(&gateway->stop_lock);
-}
-
 bool gateway_should_stop(gateway_t *gateway)
 {
     pthread_mutex_lock(&gateway->stop_lock);

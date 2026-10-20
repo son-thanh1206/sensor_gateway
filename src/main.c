@@ -5,6 +5,7 @@
 #include "debug.h"
 #include "gateway.h"
 #include "logger.h"
+#include "sbuffer.h"
 #include "storagemgr.h"
 
 #include <errno.h>
@@ -15,8 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#define N_PORTS 4
 
 static gateway_t gateway;
 static volatile sig_atomic_t caught_signal;
@@ -110,6 +109,7 @@ typedef struct {
     void *(*task)(void *);
 } worker_t;
 
+/* connmgr must stay first: it is the only sbuffer writer, joined first. */
 static const worker_t WORKERS[] = {
     { "connmgr",    connmgr_thread    },
     { "datamgr",    datamgr_thread    },
@@ -142,10 +142,15 @@ int main(int argc, char *argv[])
     int rc = gateway_sync_init(&gateway);
     if (rc != 0) {
         fprintf(stderr, "gateway_sync_init fail: %s\n", strerror(rc));
-        printlog(LOG_SRC_MAIN, "Gateway shutting down (init error)");
-        log_stop(gateway.log_pid);
-        return EXIT_FAILURE;
+        goto out_log;
     }
+    rc = sbuffer_init(&gateway.sbuf);
+    if (rc != 0) {
+        fprintf(stderr, "sbuffer_init fail: %s\n", strerror(rc));
+        goto out_sync;
+    }
+    if (connmgr_init(&gateway.conn, gateway.base_port) == -1)
+        goto out_sbuf;
 
     pthread_t tids[N_WORKERS];
     size_t n_started = 0;
@@ -177,10 +182,22 @@ int main(int argc, char *argv[])
     }
 
     gateway_request_stop(&gateway);
-    for (size_t i = 0; i < n_started; ++i) {
+    connmgr_wakeup(&gateway.conn);
+
+    /* Join the only writer (WORKERS[0]) first, then shut the sbuffer down:
+     * no measurement can be inserted after the readers have drained it. */
+    if (n_started > 0) {
+        pthread_join(tids[0], NULL);
+        DEBUG_PRINT("thread %s joined", WORKERS[0].name);
+    }
+    sbuffer_shutdown(&gateway.sbuf);
+    for (size_t i = 1; i < n_started; ++i) {
         pthread_join(tids[i], NULL);
         DEBUG_PRINT("thread %s joined", WORKERS[i].name);
     }
+
+    connmgr_cleanup(&gateway.conn);
+    sbuffer_destroy(&gateway.sbuf);
     gateway_sync_destroy(&gateway);
 
     /* Only after all threads are joined: they may log until they exit. */
@@ -188,4 +205,13 @@ int main(int argc, char *argv[])
         exit_code = EXIT_FAILURE;
 
     return exit_code;
+
+out_sbuf:
+    sbuffer_destroy(&gateway.sbuf);
+out_sync:
+    gateway_sync_destroy(&gateway);
+out_log:
+    printlog(LOG_SRC_MAIN, "Gateway shutting down (init error)");
+    log_stop(gateway.log_pid);
+    return EXIT_FAILURE;
 }
