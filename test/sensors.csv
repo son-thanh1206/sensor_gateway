@@ -11,10 +11,17 @@ type,id,host,period_ms,options
 temperature,10,127.0.0.1,100,
 temperature,11,127.0.0.1,200,
 temperature,12,127.0.0.1,50,
-temperature,13,127.0.0.1,500,
-temperature,14,127.0.0.1,100,
-# Step 4:
-# humidity,21,127.0.0.1,200,
-# motion,30,127.0.0.1,1000,
-# door,40,127.0.0.1,1000,
-# smoke_gas,50,127.0.0.1,500,--corrupt
+temperature,13,127.0.0.1,500,--fragment
+temperature,14,127.0.0.1,100,--glue --corrupt
+humidity,20,127.0.0.1,200,
+humidity,21,127.0.0.1,300,--fragment
+humidity,22,127.0.0.1,100,--glue --corrupt
+motion,30,127.0.0.1,1000,
+motion,31,127.0.0.1,500,--fragment --corrupt
+motion,32,127.0.0.1,800,--glue
+door,40,127.0.0.1,1000,
+door,41,127.0.0.1,700,--fragment
+door,42,127.0.0.1,500,--glue --corrupt
+smoke_gas,50,127.0.0.1,500,
+smoke_gas,51,127.0.0.1,300,--corrupt
+smoke_gas,52,127.0.0.1,400,--fragment --corrupt

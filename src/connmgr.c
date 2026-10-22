@@ -24,9 +24,19 @@
 
 #define REPLY_MAX  16
 
-/* One adapter per port; Step 4 adds HLP, EVP and SGP here. */
+/* Policy for repeated errors: a malformed first frame closes the connection
+ * at once; after that, MAX_CONSEC_ERRORS malformed frames in a row close it.
+ * A valid frame resets the count, so a noisy link that only corrupts a frame
+ * now and then (sensor_node --corrupt) stays connected, while a node that
+ * sends nothing but garbage is dropped instead of flooding the log. */
+#define MAX_CONSEC_ERRORS  5
+
+/* One adapter per port: ADAPTERS[i] listens on base port + port_offset. */
 static const protocol_adapter_t *const ADAPTERS[] = {
     &TBP_ADAPTER,
+    &HLP_ADAPTER,
+    &EVP_ADAPTER,
+    &SGP_ADAPTER,
 };
 #define N_ADAPTERS (sizeof ADAPTERS / sizeof ADAPTERS[0])
 _Static_assert(N_ADAPTERS <= N_PORTS, "more adapters than listening ports");
@@ -178,8 +188,12 @@ static void accept_all(connmgr_t *cm, int listen_fd,
         c->fd         = fd;
         c->adapter    = adapter;
         c->rx_len     = 0;
-        c->identified = false;
-        c->sensor_id  = 0;
+        c->identified    = false;
+        c->sensor_id     = 0;
+        c->consec_errors = 0;
+        c->has_last      = false;
+        c->last_ts       = 0;
+        c->last_value    = 0.0;
         DEBUG_PRINT("connmgr: accepted fd %d on %s port", fd, adapter->name);
     }
 }
@@ -231,6 +245,7 @@ static bool handle_readable(gateway_t *g, connection_t *c)
         send_reply(c, r);
 
         if (r == PARSE_OK) {
+            c->consec_errors = 0;
             if (!c->identified) {
                 /* The sensor ID is only known after the first valid frame. */
                 c->identified = true;
@@ -239,6 +254,20 @@ static bool handle_readable(gateway_t *g, connection_t *c)
                          "A sensor node with %u has opened a new connection",
                          data.id);
             }
+            /* SGP resends a frame whose ACK was lost or late: the copy has
+             * the same id and ts. It was ACKed again above but is not stored
+             * twice. ts has a 1 s resolution, so the value is compared too:
+             * a sensor sending faster than 1 Hz must not lose real readings. */
+            if (c->adapter == &SGP_ADAPTER && c->has_last &&
+                data.id == c->sensor_id && data.ts == c->last_ts &&
+                data.value == c->last_value) {
+                DEBUG_PRINT("connmgr: duplicate SGP frame from sensor %u ignored",
+                            data.id);
+                continue;
+            }
+            c->has_last   = true;
+            c->last_ts    = data.ts;
+            c->last_value = data.value;
             if (sbuffer_insert(&g->sbuf, &data) != 0)
                 fprintf(stderr, "connmgr: sbuffer_insert failed, frame dropped\n");
         } else if (!c->identified) {
@@ -248,9 +277,16 @@ static bool handle_readable(gateway_t *g, connection_t *c)
             keep = false;
             break;
         } else {
-            /* TODO(Step 4): log "Received malformed frame" + repeat policy */
+            printlog(LOG_SRC_CONN, "Received malformed frame on %s port (%s)",
+                     c->adapter->name, adapter_last_error());
             DEBUG_PRINT("connmgr: malformed %s frame from sensor %u, %zu bytes dropped",
                         c->adapter->name, c->sensor_id, consumed);
+            if (++c->consec_errors >= MAX_CONSEC_ERRORS) {
+                DEBUG_PRINT("connmgr: %u malformed frames in a row from sensor %u, closing",
+                            c->consec_errors, c->sensor_id);
+                keep = false;
+                break;
+            }
         }
     }
 

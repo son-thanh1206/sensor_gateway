@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,11 +14,17 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TBP_FRAME_LEN  18
-#define TEMP_START     18.0
-#define TEMP_STEP       1.0     /* max change between two measurements */
-#define TEMP_LOW       10.0     /* random walk stays in [LOW, HIGH] so  */
-#define TEMP_HIGH      26.0     /* both normal and alert values appear  */
+#include "adapters.h"
+#include "byteorder.h"
+#include "crc16.h"
+
+#define FRAME_MAX       64      /* largest frame: an HLP line */
+#define GLUE_FRAMES      3      /* frames per send() with --glue */
+#define CORRUPT_ONE_IN  10      /* --corrupt: about 1 frame in 10 is bad */
+#define FRAGMENT_GAP_MS 20      /* pause between the pieces of a frame */
+
+#define SGP_ACK_TIMEOUT_MS 1000
+#define SGP_MAX_RETRIES       3
 
 typedef struct {
     const char *type;
@@ -28,12 +35,120 @@ typedef struct {
     bool        fragment, glue, corrupt;
 } node_cfg_t;
 
+/* Simulated physical state; each kind uses the fields it needs. */
+typedef struct {
+    double  value;
+    uint8_t door_open;
+} node_state_t;
+
+/* Writes one frame into buf and returns its length. With corrupt set, the
+ * frame is made invalid in a way typical of the protocol. */
+typedef size_t (*encode_fn)(node_state_t *st, uint16_t id, int64_t ts,
+                            bool corrupt, uint8_t *buf);
+
+typedef struct {
+    const char *name;
+    uint16_t    port_offset;
+    bool        event;          /* sends on events at random intervals */
+    bool        acked;          /* waits for ACK/NAK and resends (SGP) */
+    double      start, step, low, high;   /* random walk of the value */
+    encode_fn   encode;
+} sensor_kind_t;
+
 static volatile sig_atomic_t stop;
 
 static void on_signal(int signo)
 {
     (void)signo;
     stop = 1;
+}
+
+/* Random walk: both normal and alert values appear. */
+static double walk(double v, const sensor_kind_t *k)
+{
+    v += ((double)rand() / RAND_MAX - 0.5) * 2.0 * k->step;
+    if (v < k->low)
+        v = k->low;
+    if (v > k->high)
+        v = k->high;
+    return v;
+}
+
+static size_t tbp_encode(node_state_t *st, uint16_t id, int64_t ts,
+                         bool corrupt, uint8_t *buf)
+{
+    double value = corrupt ? 999.0 : st->value;     /* out of range */
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    put_le16(buf, id);
+    put_le64(buf + 2, bits);
+    put_le64(buf + 10, (uint64_t)ts);
+    return TBP_FRAME_LEN;
+}
+
+static size_t hlp_encode(node_state_t *st, uint16_t id, int64_t ts,
+                         bool corrupt, uint8_t *buf)
+{
+    int n = corrupt
+        ? snprintf((char *)buf, FRAME_MAX, "HUM %u %.1f,%lld\n", id, st->value, (long long)ts)
+        : snprintf((char *)buf, FRAME_MAX, "HUM %u %.1f %lld\n", id, st->value, (long long)ts);
+    return (size_t)n;
+}
+
+static size_t motion_encode(node_state_t *st, uint16_t id, int64_t ts,
+                            bool corrupt, uint8_t *buf)
+{
+    (void)st;
+    buf[0] = corrupt ? 0x07 : EVP_TYPE_MOTION;      /* unknown type */
+    buf[1] = EVP_LEN_MOTION;
+    put_be16(buf + 2, id);
+    put_be32(buf + 4, (uint32_t)ts);
+    return EVP_HDR_LEN + EVP_LEN_MOTION;
+}
+
+static size_t door_encode(node_state_t *st, uint16_t id, int64_t ts,
+                          bool corrupt, uint8_t *buf)
+{
+    st->door_open = !st->door_open;                 /* each event toggles */
+    buf[0] = corrupt ? 0x07 : EVP_TYPE_DOOR;
+    buf[1] = EVP_LEN_DOOR;
+    put_be16(buf + 2, id);
+    buf[4] = st->door_open;
+    put_be32(buf + 5, (uint32_t)ts);
+    return EVP_HDR_LEN + EVP_LEN_DOOR;
+}
+
+static size_t sgp_encode(node_state_t *st, uint16_t id, int64_t ts,
+                         bool corrupt, uint8_t *buf)
+{
+    buf[0] = SGP_MAGIC;
+    put_be16(buf + 1, id);
+    put_be16(buf + 3, (uint16_t)(st->value + 0.5));
+    put_be32(buf + 5, (uint32_t)ts);
+    put_be16(buf + 9, crc16_ccitt_false(buf + 1, 8));
+    if (corrupt) {
+        if (rand() % 2)
+            buf[9] ^= 0x01;                         /* bad CRC */
+        else
+            buf[0] = 0x00;                          /* bad magic */
+    }
+    return SGP_FRAME_LEN;
+}
+
+static const sensor_kind_t KINDS[] = {
+    { "temperature", 0, false, false, 18.0,  1.0, 10.0,  26.0, tbp_encode    },
+    { "humidity",    1, false, false, 50.0,  3.0, 20.0,  80.0, hlp_encode    },
+    { "motion",      2, true,  false,  0.0,  0.0,  0.0,   0.0, motion_encode },
+    { "door",        2, true,  false,  0.0,  0.0,  0.0,   0.0, door_encode   },
+    { "smoke_gas",   3, false, true, 100.0, 30.0, 50.0, 400.0, sgp_encode    },
+};
+
+static const sensor_kind_t *find_kind(const char *name)
+{
+    for (size_t i = 0; i < sizeof KINDS / sizeof KINDS[0]; ++i)
+        if (strcmp(KINDS[i].name, name) == 0)
+            return &KINDS[i];
+    return NULL;
 }
 
 static void usage(const char *prog)
@@ -95,12 +210,11 @@ static bool parse_args(int argc, char *argv[], node_cfg_t *cfg)
         }
     }
 
-    if (strcmp(cfg->type, "temperature") != 0) {
-        fprintf(stderr, "Sensor type '%s' is not implemented yet\n", cfg->type);
+    if (find_kind(cfg->type) == NULL) {
+        fprintf(stderr, "Unknown sensor type: '%s'\n", cfg->type);
+        usage(argv[0]);
         return false;
     }
-    if (cfg->fragment || cfg->glue || cfg->corrupt)
-        fprintf(stderr, "Note: --fragment/--glue/--corrupt are ignored until Step 4\n");
     return true;
 }
 
@@ -148,26 +262,11 @@ static int connect_to(const char *host, uint16_t port)
     return fd;
 }
 
-static void put_le16(uint8_t *p, uint16_t v)
+static void sleep_ms(long ms)
 {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static void put_le64(uint8_t *p, uint64_t v)
-{
-    for (int i = 0; i < 8; ++i)
-        p[i] = (uint8_t)(v >> (8 * i));
-}
-
-static void tbp_encode(uint8_t frame[TBP_FRAME_LEN], uint16_t id,
-                       double value, int64_t ts)
-{
-    uint64_t bits;
-    memcpy(&bits, &value, sizeof bits);
-    put_le16(frame, id);
-    put_le64(frame + 2, bits);
-    put_le64(frame + 10, (uint64_t)ts);
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    /* Interrupted by SIGINT/SIGTERM (no SA_RESTART): the loop checks stop. */
+    nanosleep(&ts, NULL);
 }
 
 /* send() may write fewer bytes than asked: loop until all are sent. */
@@ -186,21 +285,63 @@ static int send_all(int fd, const uint8_t *buf, size_t len)
     return 0;
 }
 
-static double next_temperature(double t)
+/* --fragment: split the bytes into 2 or 3 pieces with a pause in between,
+ * so the gateway's recv() sees partial frames. */
+static int send_bytes(int fd, const uint8_t *buf, size_t len, bool fragment)
 {
-    t += ((double)rand() / RAND_MAX - 0.5) * 2.0 * TEMP_STEP;
-    if (t < TEMP_LOW)
-        t = TEMP_LOW;
-    if (t > TEMP_HIGH)
-        t = TEMP_HIGH;
-    return t;
+    if (!fragment || len < 3)
+        return send_all(fd, buf, len);
+
+    size_t pieces = 2 + (size_t)(rand() % 2);
+    size_t off = 0;
+    for (size_t i = 1; i <= pieces; ++i) {
+        size_t end = (i == pieces) ? len : off + 1 + (size_t)rand() % (len - off - (pieces - i));
+        if (send_all(fd, buf + off, end - off) == -1)
+            return -1;
+        off = end;
+        if (i < pieces)
+            sleep_ms(FRAGMENT_GAP_MS);
+    }
+    return 0;
 }
 
-static void sleep_ms(long ms)
+/* Waits for the SGP reply. Returns 1 on ACK, 0 on NAK/timeout, -1 if the
+ * connection is gone. */
+static int wait_reply(int fd)
 {
-    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
-    /* Interrupted by SIGINT/SIGTERM (no SA_RESTART): the loop checks stop. */
-    nanosleep(&ts, NULL);
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int rc = poll(&pfd, 1, SGP_ACK_TIMEOUT_MS);
+    if (rc <= 0)
+        return 0;                   /* timeout, or EINTR: stop is checked */
+    uint8_t b;
+    ssize_t n = recv(fd, &b, 1, 0);
+    if (n == 0)
+        errno = ECONNRESET;         /* gateway closed the connection */
+    if (n <= 0)
+        return -1;
+    return b == SGP_ACK;
+}
+
+/* Sends one SGP frame and resends it, up to SGP_MAX_RETRIES times, until it
+ * is ACKed. A resend carries the original, uncorrupted frame, as a real
+ * sensor would after noise on the line. Returns -1 if the connection is gone. */
+static int send_acked(int fd, const uint8_t *good, const uint8_t *first,
+                      size_t len, bool fragment, uint16_t id)
+{
+    const uint8_t *frame = first;
+    for (int attempt = 0; attempt <= SGP_MAX_RETRIES && !stop; ++attempt) {
+        if (send_bytes(fd, frame, len, fragment) == -1)
+            return -1;
+        int r = wait_reply(fd);
+        if (r == -1)
+            return -1;
+        if (r == 1)
+            return 0;
+        printf("sensor %u: no ACK (attempt %d), resending\n", id, attempt + 1);
+        frame = good;
+    }
+    printf("sensor %u: frame given up after %d retries\n", id, SGP_MAX_RETRIES);
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -208,6 +349,7 @@ int main(int argc, char *argv[])
     node_cfg_t cfg;
     if (!parse_args(argc, argv, &cfg))
         return EXIT_FAILURE;
+    const sensor_kind_t *kind = find_kind(cfg.type);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -220,7 +362,11 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IOLBF, 0);
     srand((unsigned)(time(NULL) ^ getpid() ^ cfg.id));
 
-    uint16_t port = cfg.base_port;          /* TBP: port offset 0 */
+    if (kind->acked && cfg.glue)
+        fprintf(stderr, "Note: --glue is ignored for smoke_gas, each frame waits for its ACK\n");
+    bool glue = cfg.glue && !kind->acked;
+
+    uint16_t port = (uint16_t)(cfg.base_port + kind->port_offset);
     char ts_buf[32];
     int fd = connect_to(cfg.host, port);
     now_str(ts_buf, sizeof ts_buf);
@@ -232,21 +378,52 @@ int main(int argc, char *argv[])
     printf("%s sensor %u %s connected to %s:%u\n",
            ts_buf, cfg.id, cfg.type, cfg.host, port);
 
-    double temp = TEMP_START;
+    node_state_t st = { .value = kind->start, .door_open = 0 };
+    unsigned long n_frames = 0;
     int exit_code = EXIT_SUCCESS;
     while (!stop) {
-        temp = next_temperature(temp);
-        int64_t ts = (int64_t)time(NULL);
-        uint8_t frame[TBP_FRAME_LEN];
-        tbp_encode(frame, cfg.id, temp, ts);
+        uint8_t buf[GLUE_FRAMES * FRAME_MAX];
+        uint8_t good[FRAME_MAX];
+        size_t len = 0;
+        int batch = glue ? GLUE_FRAMES : 1;
 
-        if (send_all(fd, frame, sizeof frame) == -1) {
+        for (int i = 0; i < batch; ++i) {
+            st.value = walk(st.value, kind);
+            int64_t ts = (int64_t)time(NULL);
+            /* Never corrupt the first frame: the gateway would drop the
+             * connection as "malformed first frame". */
+            bool corrupt = cfg.corrupt && n_frames > 0 && rand() % CORRUPT_ONE_IN == 0;
+            /* The SGP encoder does not change st: encoding twice is safe. */
+            if (kind->acked)
+                kind->encode(&st, cfg.id, ts, false, good);
+            len += kind->encode(&st, cfg.id, ts, corrupt, buf + len);
+            ++n_frames;
+
+            const char *mark = corrupt ? " (corrupt)" : "";
+            if (strcmp(kind->name, "motion") == 0)
+                printf("sent id=%u motion ts=%lld%s\n", cfg.id, (long long)ts, mark);
+            else if (strcmp(kind->name, "door") == 0)
+                printf("sent id=%u door=%s ts=%lld%s\n", cfg.id,
+                       st.door_open ? "open" : "closed", (long long)ts, mark);
+            else
+                printf("sent id=%u value=%.2f ts=%lld%s\n", cfg.id, st.value,
+                       (long long)ts, mark);
+        }
+
+        int rc = kind->acked
+            ? send_acked(fd, good, buf, len, cfg.fragment, cfg.id)
+            : send_bytes(fd, buf, len, cfg.fragment);
+        if (rc == -1) {
             fprintf(stderr, "sensor %u: send: %s\n", cfg.id, strerror(errno));
             exit_code = EXIT_FAILURE;
             break;
         }
-        printf("sent id=%u value=%.2f ts=%lld\n", cfg.id, temp, (long long)ts);
-        sleep_ms(cfg.period_ms);
+
+        /* Events (motion, door) come at random intervals with mean period. */
+        long wait = kind->event
+            ? cfg.period_ms / 2 + rand() % (cfg.period_ms + 1)
+            : cfg.period_ms;
+        sleep_ms(wait);
     }
 
     close(fd);

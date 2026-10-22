@@ -14,18 +14,20 @@ TARGET    := $(BIN_DIR)/server
 CLIENT    := $(BIN_DIR)/sensor_node
 TEST_SBUF := $(BIN_DIR)/test_sbuffer
 TEST_SENS := $(BIN_DIR)/test_sensors
+TEST_ADPT := $(BIN_DIR)/test_adapters
 
 # sensor_node.c has its own main(): built separately, not part of the server.
 CLIENT_SRC := $(SRC_DIR)/sensor_node.c
 SRCS := $(filter-out $(CLIENT_SRC), $(wildcard $(SRC_DIR)/*.c)) \
         $(wildcard $(ADAPTER_DIR)/*.c)
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+ADAPTER_OBJS := $(filter $(BUILD_DIR)/adapter/%, $(OBJS))
 DEPS := $(OBJS:.o=.d)
 
 PORT      ?= 1234
 HTTP_PORT ?= 8080
 
-.PHONY: all client test test-sensors debug run clean clean-test
+.PHONY: all client test test-sbuffer test-adapters test-sensors debug run clean clean-test
 
 all: $(TARGET) $(CLIENT)
 
@@ -34,13 +36,17 @@ client: $(CLIENT)
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(CLIENT): $(CLIENT_SRC) | $(BIN_DIR)
+# sensor_node uses the frame constants, byte order and CRC helpers of these headers.
+$(CLIENT): $(CLIENT_SRC) include/adapters.h include/byteorder.h include/crc16.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 $(TEST_SBUF): $(TEST_DIR)/test_sbuffer.c $(BUILD_DIR)/sbuffer.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-test: $(TEST_SBUF)
+# Unit tests only: test_sensors starts sensor nodes against a running server.
+test: test-sbuffer test-adapters
+
+test-sbuffer: $(TEST_SBUF)
 	$(TEST_SBUF)
 
 $(TEST_SENS): $(TEST_DIR)/test_sensors.c | $(BIN_DIR)
@@ -48,6 +54,12 @@ $(TEST_SENS): $(TEST_DIR)/test_sensors.c | $(BIN_DIR)
 
 test-sensors: $(CLIENT) $(TEST_SENS)
 	$(TEST_SENS)
+
+$(TEST_ADPT): $(TEST_DIR)/test_adapters.c $(ADAPTER_OBJS) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+test-adapters: $(TEST_ADPT)
+	$(TEST_ADPT)
 
 # mkdir per object: sources in subdirectories (src/adapter/) map to
 # matching subdirectories of build/.

@@ -37,6 +37,10 @@ typedef struct {
     size_t                  rx_len;
     bool                    identified;       /* sensor ID is known */
     sensor_id_t             sensor_id;
+    unsigned                consec_errors;    /* malformed frames in a row */
+    bool                    has_last;         /* last_ts/last_value are valid */
+    time_t                  last_ts;          /* last valid frame, to spot */
+    double                  last_value;       /* an SGP resend             */
 } connection_t;
 
 typedef struct {
