@@ -149,6 +149,10 @@ int main(int argc, char *argv[])
         fprintf(stderr, "sbuffer_init fail: %s\n", strerror(rc));
         goto out_sync;
     }
+    /* Loaded before the threads start: a bad config file stops the gateway
+     * before any sensor is accepted. */
+    if (datamgr_init(&gateway.data, ROOM_SENSOR_PATH) == -1)
+        goto out_sbuf;
     if (connmgr_init(&gateway.conn, gateway.base_port) == -1)
         goto out_sbuf;
 

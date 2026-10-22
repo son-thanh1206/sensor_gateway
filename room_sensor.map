@@ -1,0 +1,21 @@
+# Room-sensor map the valid sensors of the system.
+# Covers every sensor of test/sensors.csv; ID 99 is left out on purpose to
+# test an unknown sensor.
+# room  sensor_id  type
+501     10         temperature
+501     20         humidity
+501     30         motion
+602     11         temperature
+602     21         humidity
+602     40         door
+703     12         temperature
+703     22         humidity
+703     41         door
+703     50         smoke_gas
+804     13         temperature
+804     31         motion
+804     51         smoke_gas
+905     14         temperature
+905     32         motion
+905     42         door
+905     52         smoke_gas

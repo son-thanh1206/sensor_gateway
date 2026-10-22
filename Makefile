@@ -15,6 +15,7 @@ CLIENT    := $(BIN_DIR)/sensor_node
 TEST_SBUF := $(BIN_DIR)/test_sbuffer
 TEST_SENS := $(BIN_DIR)/test_sensors
 TEST_ADPT := $(BIN_DIR)/test_adapters
+TEST_DMGR := $(BIN_DIR)/test_datamgr
 
 # sensor_node.c has its own main(): built separately, not part of the server.
 CLIENT_SRC := $(SRC_DIR)/sensor_node.c
@@ -27,7 +28,7 @@ DEPS := $(OBJS:.o=.d)
 PORT      ?= 1234
 HTTP_PORT ?= 8080
 
-.PHONY: all client test test-sbuffer test-adapters test-sensors debug run clean clean-test
+.PHONY: all client test test-sbuffer test-adapters test-datamgr test-sensors debug run clean clean-test
 
 all: $(TARGET) $(CLIENT)
 
@@ -44,7 +45,7 @@ $(TEST_SBUF): $(TEST_DIR)/test_sbuffer.c $(BUILD_DIR)/sbuffer.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # Unit tests only: test_sensors starts sensor nodes against a running server.
-test: test-sbuffer test-adapters
+test: test-sbuffer test-adapters test-datamgr
 
 test-sbuffer: $(TEST_SBUF)
 	$(TEST_SBUF)
@@ -60,6 +61,14 @@ $(TEST_ADPT): $(TEST_DIR)/test_adapters.c $(ADAPTER_OBJS) | $(BIN_DIR)
 
 test-adapters: $(TEST_ADPT)
 	$(TEST_ADPT)
+
+# test_datamgr.c stubs printlog(), so logger.o is not linked.
+$(TEST_DMGR): $(TEST_DIR)/test_datamgr.c $(BUILD_DIR)/datamgr.o $(BUILD_DIR)/sbuffer.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+test-datamgr: $(TEST_DMGR)
+	@mkdir -p $(TEST_OUT)
+	$(TEST_DMGR)
 
 # mkdir per object: sources in subdirectories (src/adapter/) map to
 # matching subdirectories of build/.

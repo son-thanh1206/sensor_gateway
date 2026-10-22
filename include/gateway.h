@@ -57,9 +57,16 @@ typedef struct {
     size_t         count, next;
     double         running_avg;
     sensor_state_t state;
+    int            level;                     /* per-type level, logged on change: */
+                                              /* temp/hum -1 low 0 ok +1 high,     */
+                                              /* smoke 0/1, door -1 unknown 0/1    */
 } datamgr_sensor_t;
 
-typedef struct { datamgr_sensor_t sensors[MAX_SENSORS]; size_t n; } datamgr_t;
+typedef struct {
+    datamgr_sensor_t sensors[MAX_SENSORS];
+    size_t           n;
+    uint8_t          invalid_seen[65536 / 8]; /* bitmap: invalid IDs already logged */
+} datamgr_t;
 typedef void (*sensor_handler_t)(datamgr_t *, datamgr_sensor_t *, const sensor_data_t *);
 
 /* TODO(Step 6): replace these forward declarations with #include <sqlite3.h> */
