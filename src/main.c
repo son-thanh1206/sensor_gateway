@@ -80,8 +80,10 @@ static int install_signal_handlers(sigset_t *old_mask)
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
+    /* SIGUSR1 is sent by gateway_fail() when a worker thread gives up. */
     if (sigaction(SIGINT, &sa, NULL) == -1 ||
-        sigaction(SIGTERM, &sa, NULL) == -1) {
+        sigaction(SIGTERM, &sa, NULL) == -1 ||
+        sigaction(SIGUSR1, &sa, NULL) == -1) {
         perror("sigaction");
         return -1;
     }
@@ -90,12 +92,13 @@ static int install_signal_handlers(sigset_t *old_mask)
      * of SIGPIPE killing the whole gateway. */
     signal(SIGPIPE, SIG_IGN);
 
-    /* Threads created later inherit this mask, so SIGINT/SIGTERM can only
-     * be delivered to the main thread, inside sigsuspend(). */
+    /* Threads created later inherit this mask, so SIGINT/SIGTERM/SIGUSR1
+     * can only be delivered to the main thread, inside sigsuspend(). */
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGUSR1);
     int rc = pthread_sigmask(SIG_BLOCK, &block, old_mask);
     if (rc != 0) {
         fprintf(stderr, "pthread_sigmask: %s\n", strerror(rc));
@@ -155,6 +158,7 @@ int main(int argc, char *argv[])
         goto out_sbuf;
     if (connmgr_init(&gateway.conn, gateway.base_port) == -1)
         goto out_sbuf;
+    storagemgr_init(&gateway.stor, STORAGE_DB_PATH);
 
     pthread_t tids[N_WORKERS];
     size_t n_started = 0;
@@ -178,11 +182,16 @@ int main(int argc, char *argv[])
             sigsuspend(&old_mask);
     }
 
-    if (exit_code == EXIT_SUCCESS) {
-        printlog(LOG_SRC_MAIN, "Gateway shutting down (received %s)",
-                 caught_signal == SIGTERM ? "SIGTERM" : "SIGINT");
-    } else {
+    const char *fail_reason = gateway_fail_reason(&gateway);
+    if (exit_code != EXIT_SUCCESS) {
         printlog(LOG_SRC_MAIN, "Gateway shutting down (thread creation failed)");
+    } else if (fail_reason != NULL) {
+        printlog(LOG_SRC_MAIN, "Gateway shutting down (%s)", fail_reason);
+        exit_code = EXIT_FAILURE;
+    } else {
+        printlog(LOG_SRC_MAIN, "Gateway shutting down (received %s)",
+                 caught_signal == SIGTERM ? "SIGTERM" :
+                 caught_signal == SIGUSR1 ? "SIGUSR1" : "SIGINT");
     }
 
     gateway_request_stop(&gateway);

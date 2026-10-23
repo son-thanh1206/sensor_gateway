@@ -4,6 +4,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <sqlite3.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -69,10 +70,6 @@ typedef struct {
 } datamgr_t;
 typedef void (*sensor_handler_t)(datamgr_t *, datamgr_sensor_t *, const sensor_data_t *);
 
-/* TODO(Step 6): replace these forward declarations with #include <sqlite3.h> */
-typedef struct sqlite3      sqlite3;
-typedef struct sqlite3_stmt sqlite3_stmt;
-
 typedef struct {
     sqlite3      *db;
     sqlite3_stmt *insert;
@@ -119,11 +116,20 @@ typedef struct {
     pthread_mutex_t   stop_lock;
     pthread_cond_t    stop_cond;
     bool              stop_requested;
+    const char       *fail_reason;              /* set by gateway_fail(), else NULL */
 } gateway_t;
 
 int  gateway_sync_init(gateway_t *gateway);
 void gateway_sync_destroy(gateway_t *gateway);
 void gateway_request_stop(gateway_t *gateway);
 bool gateway_should_stop(gateway_t *gateway);
+
+/* Sleeps up to seconds; returns true early once a stop is requested. */
+bool gateway_wait_stop(gateway_t *gateway, unsigned seconds);
+
+/* Called by a worker thread that cannot continue: requests a stop and wakes
+ * the main thread with SIGUSR1. reason must be a string literal. */
+void gateway_fail(gateway_t *gateway, const char *reason);
+const char *gateway_fail_reason(gateway_t *gateway);
 
 #endif /* GATEWAY_H */

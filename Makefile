@@ -1,7 +1,7 @@
 CC      := gcc
 CFLAGS  := -std=gnu11 -Wall -Wextra -pthread -Iinclude
 LDFLAGS := -pthread
-LDLIBS  :=
+LDLIBS  := -lsqlite3
 
 SRC_DIR     := src
 ADAPTER_DIR := $(SRC_DIR)/adapter
@@ -16,6 +16,7 @@ TEST_SBUF := $(BIN_DIR)/test_sbuffer
 TEST_SENS := $(BIN_DIR)/test_sensors
 TEST_ADPT := $(BIN_DIR)/test_adapters
 TEST_DMGR := $(BIN_DIR)/test_datamgr
+TEST_SMGR := $(BIN_DIR)/test_storagemgr
 
 # sensor_node.c has its own main(): built separately, not part of the server.
 CLIENT_SRC := $(SRC_DIR)/sensor_node.c
@@ -28,7 +29,7 @@ DEPS := $(OBJS:.o=.d)
 PORT      ?= 1234
 HTTP_PORT ?= 8080
 
-.PHONY: all client test test-sbuffer test-adapters test-datamgr test-sensors debug run clean clean-test
+.PHONY: all client test test-sbuffer test-adapters test-datamgr test-storagemgr test-sensors debug run clean clean-test
 
 all: $(TARGET) $(CLIENT)
 
@@ -45,7 +46,7 @@ $(TEST_SBUF): $(TEST_DIR)/test_sbuffer.c $(BUILD_DIR)/sbuffer.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # Unit tests only: test_sensors starts sensor nodes against a running server.
-test: test-sbuffer test-adapters test-datamgr
+test: test-sbuffer test-adapters test-datamgr test-storagemgr
 
 test-sbuffer: $(TEST_SBUF)
 	$(TEST_SBUF)
@@ -69,6 +70,15 @@ $(TEST_DMGR): $(TEST_DIR)/test_datamgr.c $(BUILD_DIR)/datamgr.o $(BUILD_DIR)/sbu
 test-datamgr: $(TEST_DMGR)
 	@mkdir -p $(TEST_OUT)
 	$(TEST_DMGR)
+
+# test_storagemgr.c stubs printlog(); gateway.o and sbuffer.o are only
+# needed to link storagemgr_thread(), which the test does not run.
+$(TEST_SMGR): $(TEST_DIR)/test_storagemgr.c $(BUILD_DIR)/storagemgr.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/sbuffer.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+test-storagemgr: $(TEST_SMGR)
+	@mkdir -p $(TEST_OUT)
+	$(TEST_SMGR)
 
 # mkdir per object: sources in subdirectories (src/adapter/) map to
 # matching subdirectories of build/.
