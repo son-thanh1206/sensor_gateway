@@ -28,8 +28,9 @@ DEPS := $(OBJS:.o=.d)
 
 PORT      ?= 1234
 HTTP_PORT ?= 8080
+SOAK_SECONDS ?= 180
 
-.PHONY: all client test test-sbuffer test-adapters test-datamgr test-storagemgr test-sensors debug run clean clean-test
+.PHONY: all client test test-sbuffer test-adapters test-datamgr test-storagemgr test-sensors soak debug run clean clean-test
 
 all: $(TARGET) $(CLIENT)
 
@@ -88,6 +89,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 
 $(BIN_DIR):
 	mkdir -p $@
+
+soak:
+	test/soak.sh $(SOAK_SECONDS)
 
 debug:
 	$(MAKE) clean

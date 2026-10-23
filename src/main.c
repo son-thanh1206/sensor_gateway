@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static gateway_t gateway;
@@ -73,6 +74,18 @@ static bool parse_args(int argc, char *argv[])
     return true;
 }
 
+/* Every sensor node holds one descriptor, so the soft limit (often 1024)
+ * would cap the number of nodes; the hard limit is as far as we may go. */
+static void raise_fd_limit(void)
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == -1 || rl.rlim_cur == rl.rlim_max)
+        return;
+    rl.rlim_cur = rl.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &rl) == -1)
+        DEBUG_PRINT("setrlimit RLIMIT_NOFILE: %s", strerror(errno));
+}
+
 static int install_signal_handlers(sigset_t *old_mask)
 {
     struct sigaction sa;
@@ -125,6 +138,7 @@ int main(int argc, char *argv[])
     DEBUG_PRINT("Main process PID: %d", getpid());
     if (!parse_args(argc, argv))
         return EXIT_FAILURE;
+    raise_fd_limit();
 
     sigset_t old_mask;
     if (install_signal_handlers(&old_mask) == -1)

@@ -17,12 +17,17 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define REPLY_MAX  16
+#define REPLY_MAX        16
+#define ACCEPT_RETRY_MS  1000
+#define FD_RESERVE       16     /* stdio, log FIFO, listeners, wake pipe, SQLite */
 
 /* Policy for repeated errors: a malformed first frame closes the connection
  * at once; after that, MAX_CONSEC_ERRORS malformed frames in a row close it.
@@ -85,14 +90,32 @@ static int open_listener(uint16_t port)
 int connmgr_init(connmgr_t *cm, uint16_t base_port)
 {
     cm->n_conns = 0;
+    cm->accept_paused = false;
     for (size_t i = 0; i < N_PORTS; ++i) {
         cm->listen_fd[i] = -1;
         cm->listen_adapter[i] = NULL;
     }
     cm->wake_fd[0] = cm->wake_fd[1] = -1;
 
+    /* Keep FD_RESERVE descriptors free for everything else: if sensor nodes
+     * took the last one, SQLite could not open its journal and the storage
+     * manager would stop the whole gateway. */
+    struct rlimit rl;
+    cm->max_conns = SIZE_MAX;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        cm->max_conns = rl.rlim_cur > FD_RESERVE ? rl.rlim_cur - FD_RESERVE : 0;
+    DEBUG_PRINT("connmgr: at most %zu connections", cm->max_conns);
+
+    cm->cap_conns = MAX_CONN;
+    cm->conns = malloc(cm->cap_conns * sizeof *cm->conns);
+    if (cm->conns == NULL) {
+        perror("malloc connections");
+        return -1;
+    }
+
     if (pipe(cm->wake_fd) == -1) {
         perror("pipe");
+        connmgr_cleanup(cm);
         return -1;
     }
     /* The write end must never block connmgr_wakeup(). */
@@ -144,6 +167,9 @@ void connmgr_cleanup(connmgr_t *cm)
             close(cm->wake_fd[i]);
         cm->wake_fd[i] = -1;
     }
+    free(cm->conns);
+    cm->conns = NULL;
+    cm->cap_conns = 0;
 }
 
 /* Removes conns[idx] by moving the last connection into its slot. */
@@ -158,24 +184,50 @@ static void close_conn(connmgr_t *cm, size_t idx)
         DEBUG_PRINT("connmgr: unidentified connection fd %d closed", c->fd);
     close(c->fd);
     cm->conns[idx] = cm->conns[--cm->n_conns];
+    cm->accept_paused = false;
+}
+
+/* Makes room for one more connection. Returns 0 or -1. */
+static int reserve_conn(connmgr_t *cm)
+{
+    if (cm->n_conns < cm->cap_conns)
+        return 0;
+    size_t cap = cm->cap_conns * 2;
+    connection_t *conns = realloc(cm->conns, cap * sizeof *conns);
+    if (conns == NULL)
+        return -1;
+    cm->conns = conns;
+    cm->cap_conns = cap;
+    DEBUG_PRINT("connmgr: capacity raised to %zu connections", cap);
+    return 0;
 }
 
 static void accept_all(connmgr_t *cm, int listen_fd,
                        const protocol_adapter_t *adapter)
 {
-    for (;;) {
+    while (!cm->accept_paused) {
         int fd = accept(listen_fd, NULL, NULL);
         if (fd == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;                       /* backlog drained */
             if (errno == EINTR || errno == ECONNABORTED)
                 continue;
+            if (errno == EMFILE || errno == ENFILE) {
+                /* The pending connection stays in the backlog, so poll()
+                 * would report the listener readable again at once: stop
+                 * polling the listeners until a descriptor is freed. */
+                cm->accept_paused = true;
+                printlog(LOG_SRC_CONN,
+                         "Connection attempt failed on %s port (too many connections)",
+                         adapter->name);
+                return;
+            }
             printlog(LOG_SRC_CONN,
                      "Connection attempt failed on %s port (accept error)",
                      adapter->name);
             return;
         }
-        if (cm->n_conns == MAX_CONN) {
+        if (cm->n_conns >= cm->max_conns || reserve_conn(cm) == -1) {
             close(fd);
             printlog(LOG_SRC_CONN,
                      "Connection attempt failed on %s port (too many connections)",
@@ -302,16 +354,29 @@ void *connmgr_thread(void *arg)
 
     printlog(LOG_SRC_CONN, "Connection manager started");
 
-    struct pollfd pfds[1 + N_PORTS + MAX_CONN];
-    size_t        listen_idx[N_PORTS];   /* pfds slot -> listen_fd index */
+    struct pollfd *pfds = NULL;
+    size_t         pfds_cap = 0;
+    size_t         listen_idx[N_PORTS];   /* pfds slot -> listen_fd index */
 
     while (!gateway_should_stop(g)) {
+        /* Sized from cap_conns, which only grows inside accept_all(). */
+        if (pfds_cap < 1 + N_PORTS + cm->cap_conns) {
+            size_t cap = 1 + N_PORTS + cm->cap_conns;
+            struct pollfd *p = realloc(pfds, cap * sizeof *p);
+            if (p == NULL) {
+                gateway_fail(g, "out of memory");
+                break;
+            }
+            pfds = p;
+            pfds_cap = cap;
+        }
+
         size_t n = 0;
         pfds[n++] = (struct pollfd){ .fd = cm->wake_fd[0], .events = POLLIN };
 
         size_t first_listen = n;
         for (size_t i = 0; i < N_PORTS; ++i) {
-            if (cm->listen_fd[i] == -1)
+            if (cm->listen_fd[i] == -1 || cm->accept_paused)
                 continue;
             listen_idx[n - first_listen] = i;
             pfds[n++] = (struct pollfd){ .fd = cm->listen_fd[i], .events = POLLIN };
@@ -324,12 +389,20 @@ void *connmgr_thread(void *arg)
             pfds[n++] = (struct pollfd){ .fd = cm->conns[i].fd, .events = POLLIN };
 
         /* Infinite timeout: the thread sleeps until a socket is ready or
-         * connmgr_wakeup() writes to the pipe; no periodic polling. */
-        if (poll(pfds, n, -1) == -1) {
+         * connmgr_wakeup() writes to the pipe; no periodic polling. While
+         * accepting is paused, retry after a while in case the descriptors
+         * were used up by something other than our connections. */
+        int timeout = cm->accept_paused ? ACCEPT_RETRY_MS : -1;
+        int ready = poll(pfds, n, timeout);
+        if (ready == -1) {
             if (errno == EINTR)
                 continue;
             perror("poll");
             break;
+        }
+        if (ready == 0) {
+            cm->accept_paused = false;
+            continue;
         }
         if (pfds[0].revents != 0)
             break;                              /* stop requested */
@@ -360,6 +433,7 @@ void *connmgr_thread(void *arg)
      * every "opened" line in gateway.log has its matching "closed" line. */
     while (cm->n_conns > 0)
         close_conn(cm, cm->n_conns - 1);
+    free(pfds);
 
     DEBUG_PRINT("connmgr: exiting");
     return NULL;

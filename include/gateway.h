@@ -17,7 +17,7 @@
 #include "sensor_types.h"
 
 #define RX_BUF_SIZE  256
-#define MAX_CONN      64
+#define MAX_CONN      64                      /* initial capacity of conns, grows */
 #define MAX_SENSORS   64
 #define N_PORTS        4                      /* ports P .. P+3 */
 typedef enum { STATE_COLLECTING, STATE_NORMAL, STATE_ALERT } sensor_state_t;
@@ -47,8 +47,10 @@ typedef struct {
 typedef struct {
     int          listen_fd[N_PORTS];          /* ports P .. P+3, -1 = unused */
     const protocol_adapter_t *listen_adapter[N_PORTS];
-    connection_t conns[MAX_CONN];
-    size_t       n_conns;
+    connection_t *conns;                      /* heap array, cap_conns entries */
+    size_t       n_conns, cap_conns;
+    size_t       max_conns;                   /* from RLIMIT_NOFILE, see connmgr_init */
+    bool         accept_paused;               /* out of fds: listeners not polled */
     int          wake_fd[2];                  /* self-pipe: wakes poll() on stop */
 } connmgr_t;
 
